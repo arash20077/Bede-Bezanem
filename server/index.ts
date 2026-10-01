@@ -1,6 +1,45 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { db, migrate } from './lib/db.js';
+
+const DIST_DIR = path.join(process.cwd(), 'dist');
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+
+function serveStatic(req: IncomingMessage, res: ServerResponse, urlPath: string): void {
+  // SPA: unknown routes fall back to index.html
+  let filePath = path.join(DIST_DIR, urlPath === '/' ? 'index.html' : urlPath);
+  if (!filePath.startsWith(DIST_DIR)) {
+    res.writeHead(403);
+    res.end('Forbidden');
+    return;
+  }
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(DIST_DIR, 'index.html');
+  }
+  if (!fs.existsSync(filePath)) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Frontend build not found. Run npm run build.');
+    return;
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+  fs.createReadStream(filePath).pipe(res);
+}
 
 const ADMIN_STUDENT_ID = '4042103037';
 const SESSION_DAYS = 30;
@@ -175,7 +214,7 @@ const server = createServer(async (req, res) => {
  try {
   expireActivities();
   const url = new URL(req.url || '/', 'http://localhost'); const path = url.pathname; const method = req.method || 'GET';
-  if (!path.startsWith('/api/')) return send(res, 404, { error: 'یافت نشد' });
+  if (!path.startsWith('/api/')) return serveStatic(req, res, path);
   if (path === '/api/config' && method === 'GET') {
    const halls = db.prepare('SELECT * FROM dining_halls WHERE is_active=1 ORDER BY sort_order,id').all();
    const mealTypes = db.prepare('SELECT * FROM meal_types WHERE is_active=1 ORDER BY id').all();
@@ -324,3 +363,4 @@ const server = createServer(async (req, res) => {
  } catch (error) { console.error('API error',req.method,req.url,error); return send(res,500,{error:'خطایی در پردازش درخواست رخ داد. دوباره تلاش کنید.'}); }
 });
 server.listen(Number(process.env.PORT||3001),()=>console.log('Backend ready'));
+
