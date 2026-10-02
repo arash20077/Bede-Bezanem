@@ -52,15 +52,14 @@ const DEFAULT_MEAL_SCHEDULE = {
 } as const;
 
 type Json = Record<string, unknown>;
-type UserRow = { id: number; full_name: string; student_id: string; phone: string; role: string; status: string; must_change_password: number; gender: string };
+type UserRow = { id: number; full_name: string; student_id: string; phone: string; gender: 'MALE' | 'FEMALE' | null; role: string; status: string; must_change_password: number };
 type SessionUser = UserRow | null;
 
 migrate(`
 CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY AUTOINCREMENT, full_name TEXT NOT NULL, student_id TEXT NOT NULL UNIQUE,
- phone TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'USER',
+ phone TEXT NOT NULL UNIQUE, gender TEXT, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'USER',
  status TEXT NOT NULL DEFAULT 'ACTIVE', must_change_password INTEGER NOT NULL DEFAULT 0,
- gender TEXT NOT NULL DEFAULT 'MALE',
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_login_at TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -68,12 +67,11 @@ CREATE TABLE IF NOT EXISTS sessions (
  expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS dining_halls (
- id INTEGER PRIMARY KEY AUTOINCREMENT, campus TEXT NOT NULL, name TEXT NOT NULL,
- is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0,
- gender TEXT NOT NULL DEFAULT 'MALE'
+ id INTEGER PRIMARY KEY AUTOINCREMENT, campus TEXT NOT NULL, name TEXT NOT NULL, gender TEXT NOT NULL DEFAULT 'MALE',
+ is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS meal_types (
- id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0
+ id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS activities (
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL,
@@ -96,6 +94,10 @@ CREATE TABLE IF NOT EXISTS password_reset_requests (
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL DEFAULT 'NEW',
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT
 );
+CREATE TABLE IF NOT EXISTS information_change_requests (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), text TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'NEW', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT
+);
 CREATE TABLE IF NOT EXISTS notifications (
  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), type TEXT NOT NULL,
  title TEXT NOT NULL, body TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -112,57 +114,41 @@ CREATE TABLE IF NOT EXISTS admin_activity_logs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL REFERENCES users(id), action TEXT NOT NULL,
  target_type TEXT, target_id TEXT, details TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE IF NOT EXISTS info_change_requests (
- id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
- message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'NEW',
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT
-);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
 
-try { db.exec('ALTER TABLE meal_types ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0'); } catch {}
-try { db.exec("ALTER TABLE users ADD COLUMN gender TEXT NOT NULL DEFAULT 'MALE'"); } catch {}
-try { db.exec("ALTER TABLE dining_halls ADD COLUMN gender TEXT NOT NULL DEFAULT 'MALE'"); } catch {}
-try { db.exec(`CREATE TABLE IF NOT EXISTS info_change_requests (
- id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id),
- message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'NEW',
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT
-)`); } catch {}
-const seedHall = db.prepare('INSERT INTO dining_halls (campus,name,sort_order,gender) VALUES (?,?,?,?)');
+// Backward-compatible schema upgrades for databases created by older versions.
+function hasColumn(table: string, column: string) {
+ const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+ return columns.some(x => x.name === column);
+}
+if (!hasColumn('users','gender')) db.exec("ALTER TABLE users ADD COLUMN gender TEXT");
+if (!hasColumn('dining_halls','gender')) db.exec("ALTER TABLE dining_halls ADD COLUMN gender TEXT DEFAULT 'MALE'");
+
+const existingHalls = db.prepare('SELECT id,campus,name,gender FROM dining_halls').all() as {id:number;campus:string;name:string;gender:string|null}[];
+if (existingHalls.length) {
+ const renameHall = db.prepare('UPDATE dining_halls SET name=?, gender=? WHERE id=?');
+ const addFemaleHall = db.prepare('INSERT INTO dining_halls(campus,name,gender,sort_order) SELECT campus,?, ?, sort_order + 1000 FROM dining_halls WHERE id=?');
+ const femaleExists = db.prepare("SELECT 1 FROM dining_halls WHERE name=? AND gender='FEMALE' LIMIT 1");
+ existingHalls.forEach(h => {
+  const baseName = h.name.replace(/ \((?:برادران|خواهران)\)$/, '');
+  if (!h.name.endsWith('(برادران)') && !h.name.endsWith('(خواهران)')) {
+   renameHall.run(`${baseName} (برادران)`, 'MALE', h.id);
+   if (!femaleExists.get(`${baseName} (خواهران)`)) addFemaleHall.run(`${baseName} (خواهران)`, 'FEMALE', h.id);
+  }
+ });
+}
+
+const seedHall = db.prepare('INSERT INTO dining_halls (campus,name,gender,sort_order) VALUES (?,?,?,?)');
 const hallsCount = db.prepare('SELECT COUNT(*) c FROM dining_halls').get() as { c: number };
 if (hallsCount.c === 0) {
- const base = [
-  ['پردیس','سالن غذاخوری باغ ابریشم'],
-  ['علوم اجتماعی','سالن غذاخوری شکرانه'],
-  ['کشاورزی','سالن غذاخوری زیتون'],
-  ['دندانپزشکی','سالن غذاخوری بهار'],
- ];
- let order = 1;
- base.forEach(([campus, name]) => {
-  seedHall.run(campus, `${name} (برادران)`, order++, 'MALE');
-  seedHall.run(campus, `${name} (خواهران)`, order++, 'FEMALE');
- });
-} else {
-  // migrate old non-gendered halls into brother/sister pairs once
-  const plain = db.prepare("SELECT id,campus,name,sort_order FROM dining_halls WHERE name NOT LIKE '%(برادران)%' AND name NOT LIKE '%(خواهران)%' ORDER BY sort_order,id").all() as {id:number;campus:string;name:string;sort_order:number}[];
-  if (plain.length) {
-    const maxOrder = (db.prepare('SELECT COALESCE(MAX(sort_order),0) m FROM dining_halls').get() as {m:number}).m;
-    let order = maxOrder + 1;
-    for (const h of plain) {
-      db.prepare("UPDATE dining_halls SET name=?, gender='MALE' WHERE id=?").run(`${h.name} (برادران)`, h.id);
-      seedHall.run(h.campus, `${h.name} (خواهران)`, order++, 'FEMALE');
-    }
-  }
+ [['پردیس','سالن غذاخوری باغ ابریشم','MALE',1],['پردیس','سالن غذاخوری باغ ابریشم','FEMALE',2],
+  ['علوم اجتماعی','سالن غذاخوری شکرانه','MALE',3],['علوم اجتماعی','سالن غذاخوری شکرانه','FEMALE',4],
+  ['کشاورزی','سالن غذاخوری زیتون','MALE',5],['کشاورزی','سالن غذاخوری زیتون','FEMALE',6],
+  ['دندانپزشکی','سالن غذاخوری بهار','MALE',7],['دندانپزشکی','سالن غذاخوری بهار','FEMALE',8]].forEach((h) => seedHall.run(...h));
 }
 const mealCount = db.prepare('SELECT COUNT(*) c FROM meal_types').get() as { c: number };
-if (mealCount.c === 0) { db.prepare('INSERT INTO meal_types (name,sort_order) VALUES (?,1),(?,2)').run('ناهار','شام'); }
-else {
-  const mealsWithoutOrder = db.prepare('SELECT id FROM meal_types WHERE sort_order=0 ORDER BY id').all() as {id:number}[];
-  if (mealsWithoutOrder.length) {
-    const allMeals = db.prepare('SELECT id FROM meal_types ORDER BY id').all() as {id:number}[];
-    allMeals.forEach((m, i) => db.prepare('UPDATE meal_types SET sort_order=? WHERE id=?').run(i + 1, m.id));
-  }
-}
+if (mealCount.c === 0) { db.prepare('INSERT INTO meal_types (name) VALUES (?),(?)').run('ناهار','شام'); }
 db.prepare("UPDATE users SET role='ADMIN' WHERE student_id=?").run(ADMIN_STUDENT_ID);
 if (!(db.prepare("SELECT 1 FROM settings WHERE key='maintenance'").get())) db.prepare("INSERT INTO settings(key,value) VALUES('maintenance','0')").run();
 if (!(db.prepare("SELECT 1 FROM settings WHERE key='maintenance_message'").get())) db.prepare("INSERT INTO settings(key,value) VALUES('maintenance_message','سایت موقتاً در حال به‌روزرسانی است.')").run();
@@ -194,7 +180,7 @@ function sessionToken(req: IncomingMessage) {
 }
 function currentUser(req: IncomingMessage): SessionUser {
  const token = sessionToken(req); if (!token) return null;
- return db.prepare(`SELECT u.id,u.full_name,u.student_id,u.phone,u.role,u.status,u.must_change_password FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND julianday(s.expires_at)>julianday('now')`).get(crypto.createHash('sha256').update(token).digest('hex')) as UserRow | undefined || null;
+ return db.prepare(`SELECT u.id,u.full_name,u.student_id,u.phone,u.gender,u.role,u.status,u.must_change_password FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND julianday(s.expires_at)>julianday('now')`).get(crypto.createHash('sha256').update(token).digest('hex')) as UserRow | undefined || null;
 }
 function auth(req: IncomingMessage, res: ServerResponse): UserRow | null {
  const user = currentUser(req); if (!user) { send(res, 401, { error: 'برای ادامه وارد حساب شوید.' }); return null; }
@@ -259,20 +245,18 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url || '/', 'http://localhost'); const path = url.pathname; const method = req.method || 'GET';
   if (!path.startsWith('/api/')) return serveStatic(req, res, path);
   if (path === '/api/config' && method === 'GET') {
-   const me = currentUser(req);
-   const halls = (me && me.role !== 'ADMIN')
-     ? db.prepare('SELECT * FROM dining_halls WHERE is_active=1 AND gender=? ORDER BY sort_order,id').all(me.gender || 'MALE')
-     : db.prepare('SELECT * FROM dining_halls WHERE is_active=1 ORDER BY sort_order,id').all();
-   const mealTypes = db.prepare('SELECT * FROM meal_types WHERE is_active=1 ORDER BY sort_order,id').all();
+   const viewer = currentUser(req);
+    const halls = viewer?.gender ? db.prepare('SELECT * FROM dining_halls WHERE is_active=1 AND gender=? ORDER BY sort_order,id').all(viewer.gender) : [];
+   const mealTypes = db.prepare('SELECT * FROM meal_types WHERE is_active=1 ORDER BY id').all();
    const announcements = db.prepare('SELECT * FROM announcements WHERE is_active=1 ORDER BY created_at DESC').all();
    const maintenance = (db.prepare("SELECT value FROM settings WHERE key='maintenance'").get() as {value:string}).value === '1';
    const maintenanceMessage = (db.prepare("SELECT value FROM settings WHERE key='maintenance_message'").get() as {value:string}).value;
    return send(res, 200, { halls, mealTypes, announcements, maintenance, maintenanceMessage });
   }
   if (path === '/api/auth/register' && method === 'POST') {
-   const b = await body(req); const fullName=String(b.fullName||'').trim(), studentId=String(b.studentId||'').trim(), phone=String(b.phone||'').trim(), password=String(b.password||''), gender=String(b.gender||'').toUpperCase();
-   if (fullName.length<3 || !/^\d{10}$/.test(studentId) || !/^09\d{9}$/.test(phone) || password.length<8 || !['MALE','FEMALE'].includes(gender)) return send(res,400,{error:'اطلاعات فرم معتبر نیست؛ رمز باید حداقل ۸ کاراکتر باشد و جنسیت را انتخاب کنید.'});
-   try { const role=studentId===ADMIN_STUDENT_ID?'ADMIN':'USER'; db.prepare('INSERT INTO users(full_name,student_id,phone,password_hash,role,gender) VALUES(?,?,?,?,?,?)').run(fullName,studentId,phone,hashPassword(password),role,gender); return send(res,201,{ok:true}); }
+   const b = await body(req); const fullName=String(b.fullName||'').trim(), gender=String(b.gender||''), studentId=String(b.studentId||'').trim(), phone=String(b.phone||'').trim(), password=String(b.password||'');
+   if (fullName.length<3 || !['MALE','FEMALE'].includes(gender) || !/^\d{10}$/.test(studentId) || !/^09\d{9}$/.test(phone) || password.length<8) return send(res,400,{error:'اطلاعات فرم معتبر نیست؛ رمز باید حداقل ۸ کاراکتر باشد.'});
+   try { const role=studentId===ADMIN_STUDENT_ID?'ADMIN':'USER'; db.prepare('INSERT INTO users(full_name,student_id,phone,gender,password_hash,role) VALUES(?,?,?,?,?,?)').run(fullName,studentId,phone,gender,hashPassword(password),role); return send(res,201,{ok:true}); }
    catch { return send(res,409,{error:'کد دانشجویی یا شماره تلفن قبلاً ثبت شده است.'}); }
   }
   if (path === '/api/auth/login' && method === 'POST') {
@@ -283,20 +267,22 @@ const server = createServer(async (req, res) => {
    const token=crypto.randomBytes(32).toString('base64url'), hash=crypto.createHash('sha256').update(token).digest('hex');
    db.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,datetime('now',?))").run(hash,user.id,`+${SESSION_DAYS} days`);
    db.prepare('UPDATE users SET last_login_at=CURRENT_TIMESTAMP WHERE id=?').run(user.id);
-   const safeUser: UserRow = { id:user.id, full_name:user.full_name, student_id:user.student_id, phone:user.phone, role:user.role, status:user.status, must_change_password:user.must_change_password, gender:user.gender || 'MALE' };
+   const safeUser: UserRow = { id:user.id, full_name:user.full_name, student_id:user.student_id, phone:user.phone, gender:user.gender, role:user.role, status:user.status, must_change_password:user.must_change_password };
    return send(res,200,{ok:true,token,user:safeUser},[`bb_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS*86400}`]);
   }
   if(path==='/api/auth/me'&&method==='GET') return send(res,200,{user:currentUser(req)});
   if(path==='/api/auth/logout'&&method==='POST') { const token=sessionToken(req); if(token) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(crypto.createHash('sha256').update(token).digest('hex')); return send(res,200,{ok:true},['bb_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0']); }
   if(path==='/api/auth/change-password'&&method==='POST') { const u=auth(req,res); if(!u)return; const b=await body(req), next=String(b.newPassword||''); if(next.length<8)return send(res,400,{error:'رمز جدید باید حداقل ۸ کاراکتر باشد.'}); db.prepare('UPDATE users SET password_hash=?,must_change_password=0 WHERE id=?').run(hashPassword(next),u.id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id); return send(res,200,{ok:true},['bb_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0']); }
-  if(path==='/api/password-reset'&&method==='POST') { const b=await body(req), id=String(b.identifier||'').trim(); const u=db.prepare('SELECT id FROM users WHERE student_id=? OR phone=?').get(id,id) as {id:number}|undefined; if(u && !db.prepare("SELECT 1 FROM password_reset_requests WHERE user_id=? AND status='NEW'").get(u.id)) db.prepare('INSERT INTO password_reset_requests(user_id) VALUES(?)').run(u.id); return send(res,200,{ok:true,message:'اگر حسابی با این مشخصات وجود داشته باشد، درخواست ثبت شد.'}); }
+  if(path==='/api/information-change-requests'&&method==='POST'){const u=auth(req,res);if(!u)return;const b=await body(req),text=String(b.text||'').trim();if(text.length<5)return send(res,400,{error:'متن درخواست را کامل‌تر بنویسید.'});db.prepare("INSERT INTO information_change_requests(user_id,text) VALUES(?,?)").run(u.id,text);return send(res,201,{ok:true});}
+   if(path==='/api/information-change-requests/mine'&&method==='GET'){const u=auth(req,res);if(!u)return;const items=db.prepare('SELECT * FROM information_change_requests WHERE user_id=? ORDER BY created_at DESC').all(u.id);return send(res,200,{items});}
+   if(path==='/api/password-reset'&&method==='POST') { const b=await body(req), id=String(b.identifier||'').trim(); const u=db.prepare('SELECT id FROM users WHERE student_id=? OR phone=?').get(id,id) as {id:number}|undefined; if(u && !db.prepare("SELECT 1 FROM password_reset_requests WHERE user_id=? AND status='NEW'").get(u.id)) db.prepare('INSERT INTO password_reset_requests(user_id) VALUES(?)').run(u.id); return send(res,200,{ok:true,message:'اگر حسابی با این مشخصات وجود داشته باشد، درخواست ثبت شد.'}); }
   if(path==='/api/activities'&&method==='POST') {
    const u=auth(req,res); if(!u)return; const b=await body(req), kind=String(b.kind), dateKey=String(b.dateKey), hallId=Number(b.hallId), mealTypeId=Number(b.mealTypeId);
    if(!['OFFER','REQUEST'].includes(kind)||!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)||!Number.isInteger(hallId)||!Number.isInteger(mealTypeId)) return send(res,400,{error:'اطلاعات فعالیت معتبر نیست.'});
    const meal=db.prepare('SELECT name FROM meal_types WHERE id=? AND is_active=1').get(mealTypeId) as {name:string}|undefined;
    const hall=db.prepare('SELECT id,gender FROM dining_halls WHERE id=? AND is_active=1').get(hallId) as {id:number;gender:string}|undefined;
-   if(!hall||!meal) return send(res,400,{error:'سالن یا نوع غذا فعال نیست.'});
-   if(u.role!=='ADMIN' && hall.gender && hall.gender!==(u.gender||'MALE')) return send(res,403,{error:'این سالن مخصوص جنسیت شما نیست.'});
+    if(!hall||!meal) return send(res,400,{error:'سالن یا نوع غذا فعال نیست.'});
+    if(!u.gender || hall.gender!==u.gender) return send(res,403,{error:'این سلف برای جنسیت حساب شما قابل استفاده نیست.'});
    const expiresAt=dateExpiry(dateKey,meal.name);
    if(new Date(expiresAt).getTime()<=Date.now()) return send(res,409,{error:'زمان این فعالیت به پایان رسیده است.'});
    try {
@@ -305,7 +291,7 @@ const server = createServer(async (req, res) => {
     if(recent>=ACTIVITY_LIMIT){db.exec('ROLLBACK');return send(res,429,{error:'سهمیه ثبت فعالیت شما در ۲۴ ساعت گذشته تکمیل شده است.'});}
     const result=db.prepare('INSERT INTO activities(user_id,kind,date_key,hall_id,meal_type_id,expires_at) VALUES(?,?,?,?,?,?)').run(u.id,kind,dateKey,hallId,mealTypeId,expiresAt);
     db.exec('COMMIT');
-    const opposite=kind==='OFFER'?'REQUEST':'OFFER'; const matches=db.prepare("SELECT DISTINCT a.user_id FROM activities a JOIN users u2 ON u2.id=a.user_id WHERE a.kind=? AND a.date_key=? AND a.hall_id=? AND a.meal_type_id=? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now') AND a.user_id<>? AND u2.gender=?").all(opposite,dateKey,hallId,mealTypeId,u.id,u.gender||'MALE') as {user_id:number}[];
+    const opposite=kind==='OFFER'?'REQUEST':'OFFER'; const matches=db.prepare("SELECT DISTINCT a.user_id FROM activities a JOIN users other ON other.id=a.user_id WHERE a.kind=? AND a.date_key=? AND a.hall_id=? AND a.meal_type_id=? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now') AND a.user_id<>? AND other.gender=?").all(opposite,dateKey,hallId,mealTypeId,u.id,u.gender) as {user_id:number}[];
     matches.forEach(x=>notify(x.user_id,'NEW_MATCH','تطبیق جدید','یک فعالیت منطبق با درخواست شما ثبت شد.')); return send(res,201,{ok:true,id:Number(result.lastInsertRowid)});
    } catch(error) { try{db.exec('ROLLBACK')}catch{} console.error('Create activity failed',u.id,error); return send(res,409,{error:'این فعالیت فعال قبلاً ثبت شده است.'}); }
   }
@@ -329,10 +315,10 @@ const server = createServer(async (req, res) => {
   const candidates=path.match(/^\/api\/activities\/(\d+)\/candidates$/);
   if(candidates&&method==='GET') {
    const u=auth(req,res);if(!u)return;
-   const source=db.prepare("SELECT * FROM activities WHERE id=? AND user_id=? AND status='ACTIVE' AND julianday(expires_at)>julianday('now')").get(Number(candidates[1]),u.id) as any;
+   const source=db.prepare("SELECT a.*,h.gender hall_gender FROM activities a JOIN dining_halls h ON h.id=a.hall_id WHERE a.id=? AND a.user_id=? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now')").get(Number(candidates[1]),u.id) as any;
    if(!source)return send(res,404,{error:'فعالیت فعال پیدا نشد.'});
    const opposite=source.kind==='OFFER'?'REQUEST':'OFFER';
-   const items=activityRows("WHERE a.kind=? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now') AND a.date_key=? AND a.hall_id=? AND a.meal_type_id=? AND a.user_id<>? AND u.gender=? AND NOT EXISTS (SELECT 1 FROM matches x WHERE x.offer_id=CASE WHEN ?='OFFER' THEN ? ELSE a.id END AND x.request_id=CASE WHEN ?='REQUEST' THEN ? ELSE a.id END AND x.status IN ('PENDING','CONNECTED'))",[opposite,source.date_key,source.hall_id,source.meal_type_id,u.id,u.gender||'MALE',source.kind,source.id,source.kind,source.id]);
+   const items=activityRows("JOIN users candidate_user ON candidate_user.id=a.user_id JOIN dining_halls candidate_hall ON candidate_hall.id=a.hall_id WHERE a.kind=? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now') AND a.date_key=? AND a.hall_id=? AND a.meal_type_id=? AND a.user_id<>? AND candidate_user.gender=? AND candidate_hall.gender=? AND NOT EXISTS (SELECT 1 FROM matches x WHERE x.offer_id=CASE WHEN ?='OFFER' THEN ? ELSE a.id END AND x.request_id=CASE WHEN ?='REQUEST' THEN ? ELSE a.id END AND x.status IN ('PENDING','CONNECTED'))",[opposite,source.date_key,source.hall_id,source.meal_type_id,u.id,u.gender,u.gender,source.kind,source.id,source.kind,source.id]);
    return send(res,200,{items});
   }
   if(path==='/api/matches'&&method==='POST') {
@@ -340,10 +326,8 @@ const server = createServer(async (req, res) => {
    try {
     db.exec('BEGIN IMMEDIATE');
     const source=db.prepare("SELECT * FROM activities WHERE id=? AND user_id=? AND status='ACTIVE' AND julianday(expires_at)>julianday('now')").get(sourceActivityId,u.id) as any;
-    const target=db.prepare("SELECT * FROM activities WHERE id=? AND user_id<>? AND status='ACTIVE' AND julianday(expires_at)>julianday('now')").get(targetActivityId,u.id) as any;
-    if(!source||!target||source.kind===target.kind||source.date_key!==target.date_key||source.hall_id!==target.hall_id||source.meal_type_id!==target.meal_type_id) throw new Error('invalid');
-    const targetUser=db.prepare('SELECT gender FROM users WHERE id=?').get(target.user_id) as {gender:string}|undefined;
-    if(!targetUser || (targetUser.gender||'MALE')!==(u.gender||'MALE')) throw new Error('gender');
+    const target=db.prepare("SELECT a.*,h.gender hall_gender,u.gender user_gender FROM activities a JOIN dining_halls h ON h.id=a.hall_id JOIN users u ON u.id=a.user_id WHERE a.id=? AND a.user_id<>? AND a.status='ACTIVE' AND julianday(a.expires_at)>julianday('now')").get(targetActivityId,u.id) as any;
+    if(!source||!target||!u.gender||target.user_gender!==u.gender||target.hall_gender!==u.gender||source.kind===target.kind||source.date_key!==target.date_key||source.hall_id!==target.hall_id||source.meal_type_id!==target.meal_type_id) throw new Error('invalid');
     const offer=source.kind==='OFFER'?source:target, request=source.kind==='REQUEST'?source:target;
     const r=db.prepare('INSERT INTO matches(offer_id,request_id,selected_by,offer_confirmed,request_confirmed,status) VALUES(?,?,?,?,?,\'PENDING\')').run(offer.id,request.id,u.id,source.kind==='OFFER'?1:0,source.kind==='REQUEST'?1:0);
     notify(target.user_id,'CONNECTION_REQUEST','درخواست ارتباط جدید',source.kind==='REQUEST'?'یک دانشجو برای غذای شما درخواست ارتباط فرستاده است.':'یک دانشجو برای درخواست غذای شما پیام ارتباط فرستاده است.');
@@ -352,7 +336,7 @@ const server = createServer(async (req, res) => {
   }
   if(path==='/api/matches/mine'&&method==='GET') {
    const u=auth(req,res);if(!u)return;
-   const items=db.prepare(`SELECT x.*,o.user_id offer_user_id,r.user_id request_user_id,o.date_key,h.name hall_name,mt.name meal_name,uo.full_name offer_name,ur.full_name request_name,CASE WHEN x.selected_by=? THEN 'SENT' ELSE 'RECEIVED' END direction,CASE WHEN x.status='CONNECTED' THEN CASE WHEN o.user_id=? THEN ur.phone ELSE uo.phone END END other_phone FROM matches x JOIN activities o ON o.id=x.offer_id JOIN activities r ON r.id=x.request_id JOIN dining_halls h ON h.id=o.hall_id JOIN meal_types mt ON mt.id=o.meal_type_id JOIN users uo ON uo.id=o.user_id JOIN users ur ON ur.id=r.user_id WHERE o.user_id=? OR r.user_id=? ORDER BY x.updated_at DESC`).all(u.id,u.id,u.id,u.id);
+   const items=db.prepare(`SELECT x.*,o.user_id offer_user_id,r.user_id request_user_id,o.date_key,h.name hall_name,mt.name meal_name,uo.full_name offer_name,ur.full_name request_name,CASE WHEN x.selected_by=? THEN 'SENT' ELSE 'RECEIVED' END direction,CASE WHEN x.status='CONNECTED' THEN CASE WHEN o.user_id=? THEN ur.phone ELSE uo.phone END END other_phone FROM matches x JOIN activities o ON o.id=x.offer_id JOIN activities r ON r.id=x.request_id JOIN dining_halls h ON h.id=o.hall_id JOIN meal_types mt ON mt.id=o.meal_type_id JOIN users uo ON uo.id=o.user_id JOIN users ur ON ur.id=r.user_id WHERE (o.user_id=? OR r.user_id=?) AND uo.gender=? AND ur.gender=? ORDER BY x.updated_at DESC`).all(u.id,u.id,u.gender,u.gender);
    return send(res,200,{items});
   }
   const confirm=path.match(/^\/api\/matches\/(\d+)\/confirm$/);
@@ -389,8 +373,10 @@ const server = createServer(async (req, res) => {
   if(path==='/api/notifications/read'&&method==='POST'){const u=auth(req,res);if(!u)return;db.prepare('UPDATE notifications SET is_read=1 WHERE user_id=?').run(u.id);return send(res,200,{ok:true});}
   if(path==='/api/reports'&&method==='POST'){const u=auth(req,res);if(!u)return;const b=await body(req),category=String(b.category),details=String(b.details||''),activityId=b.activityId?Number(b.activityId):null;if(!['FAKE','BEHAVIOR','ABUSE','SUSPICIOUS','OTHER'].includes(category))return send(res,400,{error:'نوع گزارش معتبر نیست.'});db.prepare('INSERT INTO reports(reporter_id,activity_id,category,details) VALUES(?,?,?,?)').run(u.id,activityId,category,details);return send(res,201,{ok:true});}
   if(path==='/api/admin/dashboard'&&method==='GET'){const a=admin(req,res);if(!a)return; const scalar=(q:string)=>(db.prepare(q).get() as {c:number}).c; return send(res,200,{stats:{users:scalar('SELECT COUNT(*) c FROM users'),activeUsers:scalar("SELECT COUNT(*) c FROM users WHERE status='ACTIVE'"),offers:scalar("SELECT COUNT(*) c FROM activities WHERE kind='OFFER' AND status='ACTIVE'"),requests:scalar("SELECT COUNT(*) c FROM activities WHERE kind='REQUEST' AND status='ACTIVE'"),matches:scalar("SELECT COUNT(*) c FROM matches WHERE status IN ('PENDING','CONNECTED')"),resets:scalar("SELECT COUNT(*) c FROM password_reset_requests WHERE status='NEW'"),reports:scalar("SELECT COUNT(*) c FROM reports WHERE status='NEW'")}});}
-  if(path==='/api/admin/data'&&method==='GET'){const a=admin(req,res);if(!a)return;return send(res,200,{users:db.prepare('SELECT id,full_name,student_id,phone,role,status,gender,created_at,last_login_at FROM users ORDER BY created_at DESC').all(),activities:activityRows('',[]),resets:db.prepare('SELECT p.*,u.full_name,u.student_id,u.phone FROM password_reset_requests p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC').all(),reports:db.prepare('SELECT r.*,u.full_name reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY r.created_at DESC').all(),announcements:db.prepare('SELECT * FROM announcements ORDER BY created_at DESC').all(),halls:db.prepare('SELECT * FROM dining_halls ORDER BY sort_order,id').all(),mealTypes:db.prepare('SELECT * FROM meal_types ORDER BY sort_order,id').all(),logs:db.prepare('SELECT l.*,u.full_name admin_name FROM admin_activity_logs l JOIN users u ON u.id=l.admin_id ORDER BY l.created_at DESC LIMIT 200').all(),changeRequests:db.prepare('SELECT r.*,u.full_name,u.student_id,u.phone,u.gender FROM info_change_requests r JOIN users u ON u.id=r.user_id ORDER BY r.created_at DESC').all(),settings:Object.fromEntries((db.prepare('SELECT * FROM settings').all() as {key:string,value:string}[]).map(x=>[x.key,x.value]))});}
+  if(path==='/api/admin/data'&&method==='GET'){const a=admin(req,res);if(!a)return;return send(res,200,{users:db.prepare('SELECT id,full_name,student_id,phone,gender,role,status,created_at,last_login_at FROM users ORDER BY created_at DESC').all(),activities:activityRows('',[]),resets:db.prepare('SELECT p.*,u.full_name,u.student_id,u.phone FROM password_reset_requests p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC').all(),changeRequests:db.prepare('SELECT r.*,u.full_name,u.student_id,u.phone,u.gender FROM information_change_requests r JOIN users u ON u.id=r.user_id ORDER BY r.created_at DESC').all(),reports:db.prepare('SELECT r.*,u.full_name reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY r.created_at DESC').all(),announcements:db.prepare('SELECT * FROM announcements ORDER BY created_at DESC').all(),halls:db.prepare('SELECT * FROM dining_halls ORDER BY sort_order,id').all(),mealTypes:db.prepare('SELECT * FROM meal_types ORDER BY id').all(),logs:db.prepare('SELECT l.*,u.full_name admin_name FROM admin_activity_logs l JOIN users u ON u.id=l.admin_id ORDER BY l.created_at DESC LIMIT 200').all(),settings:Object.fromEntries((db.prepare('SELECT * FROM settings').all() as {key:string,value:string}[]).map(x=>[x.key,x.value]))});}
   if(path==='/api/admin/action'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req),action=String(b.action),id=Number(b.id); if(action==='USER_STATUS'){const status=String(b.value);if(!['ACTIVE','INACTIVE','BLOCKED'].includes(status))return send(res,400,{error:'وضعیت نامعتبر است.'});db.prepare('UPDATE users SET status=? WHERE id=? AND role<>\'ADMIN\'').run(status,id);logAdmin(a.id,'تغییر وضعیت کاربر','USER',String(id),status);}
+    else if(action==='USER_GENDER'){const gender=String(b.value);if(!['MALE','FEMALE'].includes(gender))return send(res,400,{error:'جنسیت نامعتبر است.'});const changed=db.prepare('UPDATE users SET gender=? WHERE id=?').run(gender,id);if(!changed.changes)return send(res,404,{error:'کاربر پیدا نشد.'});logAdmin(a.id,'تغییر جنسیت کاربر','USER',String(id),gender);}
+    else if(action==='CHANGE_REQUEST_STATUS'){const status=String(b.value);if(!['NEW','RESOLVED'].includes(status))return send(res,400,{error:'وضعیت درخواست نامعتبر است.'});db.prepare("UPDATE information_change_requests SET status=?,resolved_at=CASE WHEN ?='RESOLVED' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id=?").run(status,status,id);logAdmin(a.id,'تغییر وضعیت درخواست اطلاعات','CHANGE_REQUEST',String(id),status);}
    else if(action==='ACTIVITY_DISABLE'){
     try { db.exec('BEGIN IMMEDIATE');const changed=db.prepare("UPDATE activities SET status='DISABLED' WHERE id=? AND status='ACTIVE' AND julianday(expires_at)>julianday('now')").run(id);if(!changed.changes){db.exec('ROLLBACK');return send(res,409,{error:'فقط فعالیت فعال و معتبر قابل غیرفعال‌کردن است.'});}const pending=db.prepare("SELECT selected_by FROM matches WHERE status='PENDING' AND (offer_id=? OR request_id=?)").all(id,id) as {selected_by:number}[];db.prepare("UPDATE matches SET status='CANCELLED',updated_at=CURRENT_TIMESTAMP WHERE status='PENDING' AND (offer_id=? OR request_id=?)").run(id,id);logAdmin(a.id,'غیرفعال‌کردن فعالیت','ACTIVITY',String(id),'ACTIVE → DISABLED');db.exec('COMMIT');pending.forEach(x=>notify(x.selected_by,'REQUEST_CANCELLED','درخواست بسته شد','فعالیت طرف مقابل توسط مدیریت غیرفعال شد.'));}
     catch(error){try{db.exec('ROLLBACK')}catch{}console.error('Admin disable activity failed',a.id,id,error);return send(res,500,{error:'عملیات انجام نشد. لطفاً دوباره تلاش کنید.'});}
@@ -404,14 +390,10 @@ const server = createServer(async (req, res) => {
    else if(action==='TOGGLE_MEAL'){db.prepare('UPDATE meal_types SET is_active=? WHERE id=?').run(Number(b.value),id);logAdmin(a.id,'تغییر نوع غذا','MEAL_TYPE',String(id));}
    else if(action==='TOGGLE_ANNOUNCEMENT'){db.prepare('UPDATE announcements SET is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(Number(b.value),id);logAdmin(a.id,'تغییر وضعیت اطلاعیه','ANNOUNCEMENT',String(id),String(b.value));}
    else if(action==='DELETE_ANNOUNCEMENT'){const removed=db.prepare('DELETE FROM announcements WHERE id=?').run(id);if(!removed.changes)return send(res,404,{error:'اطلاعیه پیدا نشد.'});logAdmin(a.id,'حذف اطلاعیه','ANNOUNCEMENT',String(id));}
-   else if(action==='SET_GENDER'){const g=String(b.value||'').toUpperCase();if(!['MALE','FEMALE'].includes(g))return send(res,400,{error:'جنسیت نامعتبر است.'});db.prepare('UPDATE users SET gender=? WHERE id=?').run(g,id);logAdmin(a.id,'تغییر جنسیت کاربر','USER',String(id),g);}
-   else if(action==='RESOLVE_CHANGE_REQUEST'){const updated=db.prepare("UPDATE info_change_requests SET status='RESOLVED',resolved_at=CURRENT_TIMESTAMP WHERE id=?").run(id);if(!updated.changes)return send(res,404,{error:'درخواست پیدا نشد.'});logAdmin(a.id,'رسیدگی درخواست تغییر اطلاعات','CHANGE_REQUEST',String(id));}
    else return send(res,400,{error:'عملیات ناشناخته است.'}); return send(res,200,{ok:true});}
   if(path==='/api/admin/temp-password'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req),resetId=Number(b.resetId);const reset=db.prepare("SELECT * FROM password_reset_requests WHERE id=? AND status='NEW'").get(resetId) as any;if(!reset)return send(res,404,{error:'درخواست بازیابی پیدا نشد.'});const temp=crypto.randomBytes(6).toString('base64url')+'7a';db.prepare('UPDATE users SET password_hash=?,must_change_password=1 WHERE id=?').run(hashPassword(temp),reset.user_id);db.prepare("UPDATE password_reset_requests SET status='DONE',resolved_at=CURRENT_TIMESTAMP WHERE id=?").run(resetId);db.prepare('DELETE FROM sessions WHERE user_id=?').run(reset.user_id);logAdmin(a.id,'تولید رمز موقت','USER',String(reset.user_id));return send(res,200,{ok:true,tempPassword:temp});}
   if(path==='/api/admin/announcements'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req),id=Number(b.id||0),title=String(b.title||'').trim(),text=String(b.body||'').trim(),level=String(b.level||'NORMAL');if(!title||!text||!['NORMAL','WARNING','IMPORTANT'].includes(level))return send(res,400,{error:'اطلاعیه کامل نیست.'});if(id){const updated=db.prepare('UPDATE announcements SET title=?,body=?,level=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').run(title,text,level,id);if(!updated.changes)return send(res,404,{error:'اطلاعیه پیدا نشد.'});}else db.prepare('INSERT INTO announcements(title,body,level) VALUES(?,?,?)').run(title,text,level);logAdmin(a.id,id?'ویرایش اطلاعیه':'ایجاد اطلاعیه','ANNOUNCEMENT',String(id||'NEW'));return send(res,200,{ok:true});}
-  if(path==='/api/admin/catalog'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req),type=String(b.type),action=String(b.action||'ADD'),id=Number(b.id||0);if(action==='MOVE'){const direction=String(b.direction||'');if(!['up','down'].includes(direction))return send(res,400,{error:'جهت نامعتبر است.'});const table=type==='HALL'?'dining_halls':type==='MEAL'?'meal_types':null;if(!table)return send(res,400,{error:'نوع نامعتبر است.'});const current=db.prepare(`SELECT id,sort_order FROM ${table} WHERE id=?`).get(id) as {id:number;sort_order:number}|undefined;if(!current)return send(res,404,{error:'مورد پیدا نشد.'});const neighbor=direction==='up'?db.prepare(`SELECT id,sort_order FROM ${table} WHERE sort_order<? ORDER BY sort_order DESC LIMIT 1`).get(current.sort_order) as {id:number;sort_order:number}|undefined:db.prepare(`SELECT id,sort_order FROM ${table} WHERE sort_order>? ORDER BY sort_order ASC LIMIT 1`).get(current.sort_order) as {id:number;sort_order:number}|undefined;if(neighbor){db.prepare(`UPDATE ${table} SET sort_order=? WHERE id=?`).run(neighbor.sort_order,current.id);db.prepare(`UPDATE ${table} SET sort_order=? WHERE id=?`).run(current.sort_order,neighbor.id);logAdmin(a.id,type==='HALL'?'جابه‌جایی سالن':'جابه‌جایی نوع غذا',type==='HALL'?'HALL':'MEAL_TYPE',String(id),direction);}return send(res,200,{ok:true});}const name=String(b.name||'').trim();if(!name)return send(res,400,{error:'نام لازم است.'});const gender=String(b.gender||'MALE').toUpperCase();if(type==='HALL'&&!['MALE','FEMALE'].includes(gender))return send(res,400,{error:'جنسیت سالن نامعتبر است.'});if(type==='HALL'){if(id){const updated=db.prepare('UPDATE dining_halls SET campus=?,name=?,gender=? WHERE id=?').run(String(b.campus||'دانشگاه رازی'),name,gender,id);if(!updated.changes)return send(res,404,{error:'سالن پیدا نشد.'});logAdmin(a.id,'ویرایش سالن','HALL',String(id));}else{const maxOrder=(db.prepare('SELECT COALESCE(MAX(sort_order),0) m FROM dining_halls').get() as {m:number}).m;db.prepare('INSERT INTO dining_halls(campus,name,sort_order,gender) VALUES(?,?,?,?)').run(String(b.campus||'دانشگاه رازی'),name,maxOrder+1,gender);logAdmin(a.id,'افزودن سالن','HALL');}}else if(type==='MEAL'){if(id){const updated=db.prepare('UPDATE meal_types SET name=? WHERE id=?').run(name,id);if(!updated.changes)return send(res,404,{error:'نوع غذا پیدا نشد.'});logAdmin(a.id,'ویرایش نوع غذا','MEAL_TYPE',String(id));}else{const maxOrder=(db.prepare('SELECT COALESCE(MAX(sort_order),0) m FROM meal_types').get() as {m:number}).m;db.prepare('INSERT INTO meal_types(name,sort_order) VALUES(?,?)').run(name,maxOrder+1);logAdmin(a.id,'افزودن نوع غذا','MEAL_TYPE');}}else return send(res,400,{error:'نوع نامعتبر است.'});return send(res,id?200:201,{ok:true});}
-  if(path==='/api/profile/change-request'&&method==='POST'){const u=auth(req,res);if(!u)return;const b=await body(req),message=String(b.message||'').trim();if(message.length<5)return send(res,400,{error:'متن درخواست خیلی کوتاه است.'});if(db.prepare("SELECT 1 FROM info_change_requests WHERE user_id=? AND status='NEW'").get(u.id))return send(res,409,{error:'یک درخواست باز دارید؛ منتظر رسیدگی بمانید.'});db.prepare('INSERT INTO info_change_requests(user_id,message) VALUES(?,?)').run(u.id,message);return send(res,201,{ok:true});}
-  if(path==='/api/profile/change-requests'&&method==='GET'){const u=auth(req,res);if(!u)return;const items=db.prepare('SELECT id,message,status,created_at,resolved_at FROM info_change_requests WHERE user_id=? ORDER BY created_at DESC').all(u.id);return send(res,200,{items});}
+  if(path==='/api/admin/catalog'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req),type=String(b.type),name=String(b.name||'').trim();if(!name)return send(res,400,{error:'نام لازم است.'});if(type==='HALL'){const gender=String(b.gender||'');if(!['MALE','FEMALE'].includes(gender))return send(res,400,{error:'نوع جنسیت سلف را انتخاب کنید.'});db.prepare('INSERT INTO dining_halls(campus,name,gender,sort_order) VALUES(?,?,?,?)').run(String(b.campus||'دانشگاه رازی'),name,gender,Number(b.sortOrder||99));logAdmin(a.id,'افزودن سالن','HALL');}else if(type==='MEAL'){db.prepare('INSERT INTO meal_types(name) VALUES(?)').run(name);logAdmin(a.id,'افزودن نوع غذا','MEAL_TYPE');}else return send(res,400,{error:'نوع نامعتبر است.'});return send(res,201,{ok:true});}
   if(path==='/api/admin/settings'&&method==='POST'){const a=admin(req,res);if(!a)return;const b=await body(req);db.prepare("UPDATE settings SET value=? WHERE key='maintenance'").run(b.maintenance?'1':'0');db.prepare("UPDATE settings SET value=? WHERE key='maintenance_message'").run(String(b.message||'سایت موقتاً در حال به‌روزرسانی است.'));logAdmin(a.id,'تغییر تنظیمات','SETTINGS');return send(res,200,{ok:true});}
   return send(res,404,{error:'مسیر پیدا نشد.'});
  } catch (error) { console.error('API error',req.method,req.url,error); return send(res,500,{error:'خطایی در پردازش درخواست رخ داد. دوباره تلاش کنید.'}); }
